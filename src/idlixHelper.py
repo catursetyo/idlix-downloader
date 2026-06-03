@@ -17,16 +17,15 @@ import subprocess
 import m3u8_To_MP4
 from loguru import logger
 from bs4 import BeautifulSoup
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urljoin
 from vtt_to_srt.vtt_to_srt import ConvertFile
 from curl_cffi import requests as cffi_requests
 from src.CryptoJsAesHelper import CryptoJsAes, dec
 
 
 class IdlixHelper:
-    BASE_WEB_URL = "https://tv10.idlixku.com/"
+    BASE_WEB_URL = "https://z2.idlixku.com/"
     BASE_STATIC_HEADERS = {
-        "Host": "tv10.idlixku.com",
         "Connection": "keep-alive",
         "sec-ch-ua": "Not)A;Brand;v=99, Google Chrome;v=127, Chromium;v=127",
         "sec-ch-ua-mobile": "?0",
@@ -122,32 +121,63 @@ class IdlixHelper:
         try:
             request = self.request.get(
                 url=self.BASE_WEB_URL,
-                timeout=10
+                timeout=20
             )
-            if request.status_code == 200:
-                bs = BeautifulSoup(request.text, 'html.parser')
-                tmp_featured = []
-                for featured in bs.find('div', {'class': 'items featured'}).find_all('article'):
 
-                    if featured.find('a').get('href').split('/')[3] == 'tvseries':
-                        continue
-
-                    tmp_featured.append({
-                        "url": featured.find('a').get('href'),
-                        "title": featured.find('h3').text,
-                        "year": featured.find('span').text,
-                        "type": featured.find('a').get('href').split('/')[3],
-                        "poster": featured.find('img').get('src'),
-                    })
-                return {
-                    'status': True,
-                    'featured_movie': tmp_featured
-                }
-            else:
+            if request.status_code != 200:
                 return {
                     'status': False,
-                    'message': 'Failed to get home page'
+                    'message': f'Failed to get home page: HTTP {request.status_code}'
                 }
+
+            bs = BeautifulSoup(request.text, 'html.parser')
+            tmp_featured = []
+            seen = set()
+
+            for a in bs.find_all('a', href=True):
+                href = a.get('href')
+
+                if not href:
+                    continue
+
+                full_url = urljoin(self.BASE_WEB_URL, href)
+                path = urlparse(full_url).path
+
+                if not (path.startswith('/movie/') or path.startswith('/series/')):
+                    continue
+
+                title = a.get_text(" ", strip=True)
+
+                if not title or title.lower() in ['film', 'serial tv']:
+                    continue
+
+                if full_url in seen:
+                    continue
+
+                seen.add(full_url)
+
+                year_match = re.search(r'\((\d{4})\)', title)
+                year = year_match.group(1) if year_match else '-'
+
+                tmp_featured.append({
+                    "url": full_url,
+                    "title": title,
+                    "year": year,
+                    "type": "movie" if path.startswith('/movie/') else "series",
+                    "poster": "",
+                })
+
+            if not tmp_featured:
+                return {
+                    'status': False,
+                    'message': 'No movie/series links found on homepage'
+                }
+
+            return {
+                'status': True,
+                'featured_movie': tmp_featured
+            }
+
         except Exception as error_get_home:
             return {
                 'status': False,

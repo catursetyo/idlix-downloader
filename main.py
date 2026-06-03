@@ -8,12 +8,26 @@ RETRY_LIMIT = 3
 
 
 def retry(func, *args, **kwargs):
-    for _ in range(RETRY_LIMIT):
+    last_result = None
+
+    for i in range(RETRY_LIMIT):
         result = func(*args, **kwargs)
+        last_result = result
+
         if result and result.get("status"):
             return result
+
+        logger.warning(
+            f"Retry {i + 1}/{RETRY_LIMIT} failed: "
+            f"{result.get('message') if result else 'No result'}"
+        )
+
         time.sleep(1)
-    return {"status": False, "message": "Maximum retry reached"}
+
+    return {
+        "status": False,
+        "message": last_result.get("message", "Maximum retry reached") if last_result else "Maximum retry reached"
+    }
 
 
 def play_m3u8_thread(idlix_helper):
