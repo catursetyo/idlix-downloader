@@ -26,7 +26,7 @@ def retry(func, *args, **kwargs):
 
     return {
         "status": False,
-        "message": last_result.get("message", "Maximum retry reached") if last_result else "Maximum retry reached"
+        "message": (last_result or {}).get("message", "Maximum retry reached")
     }
 
 
