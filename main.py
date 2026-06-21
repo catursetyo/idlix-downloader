@@ -8,25 +8,29 @@ RETRY_LIMIT = 3
 
 
 def retry(func, *args, **kwargs):
-    last_result = None
+    error_message = "Maximum retry reached"
 
     for i in range(RETRY_LIMIT):
         result = func(*args, **kwargs)
-        last_result = result
 
         if result and result.get("status"):
             return result
 
+        result_message = result.get("message", "No result") if result else "No result"
+
+        if result:
+            error_message = result_message
+
         logger.warning(
             f"Retry {i + 1}/{RETRY_LIMIT} failed: "
-            f"{result.get('message') if result else 'No result'}"
+            f"{result_message}"
         )
 
         time.sleep(1)
 
     return {
         "status": False,
-        "message": last_result.get("message", "Maximum retry reached") if last_result else "Maximum retry reached"
+        "message": error_message
     }
 
 
@@ -140,25 +144,30 @@ def main():
         idlix = IdlixHelper()
         home = retry(idlix.get_home)
 
-        if not home.get("status") or len(home.get("featured_movie", [])) == 0:
-            logger.error(f"Error fetching home: {home.get('message')}")
-            break
+        featured = home.get("featured_movie", []) if home.get("status") else []
+        if featured:
+            show_featured_table(featured)
+        else:
+            logger.warning(f"Featured movie list unavailable: {home.get('message')}")
 
-        featured = home["featured_movie"]
-        show_featured_table(featured)
+        choices = [
+            "Download Movie by URL",
+            "Play Movie by URL",
+            "Exit"
+        ]
+        if featured:
+            choices = [
+                "Download Featured Movie",
+                "Play Featured Movie",
+                *choices
+            ]
 
         # Main Menu
         question = [
             inquirer.List(
                 "action",
                 message="Select action",
-                choices=[
-                    "Download Featured Movie",
-                    "Play Featured Movie",
-                    "Download Movie by URL",
-                    "Play Movie by URL",
-                    "Exit"
-                ],
+                choices=choices,
                 carousel=True
             )
         ]
