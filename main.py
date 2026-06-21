@@ -8,13 +8,16 @@ RETRY_LIMIT = 3
 
 
 def retry(func, *args, **kwargs):
-    result = None
+    error_message = "Maximum retry reached"
 
     for i in range(RETRY_LIMIT):
         result = func(*args, **kwargs)
 
         if result and result.get("status"):
             return result
+
+        if result:
+            error_message = result.get("message", error_message)
 
         logger.warning(
             f"Retry {i + 1}/{RETRY_LIMIT} failed: "
@@ -25,7 +28,7 @@ def retry(func, *args, **kwargs):
 
     return {
         "status": False,
-        "message": (result or {}).get("message", "Maximum retry reached")
+        "message": error_message
     }
 
 
