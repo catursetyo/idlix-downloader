@@ -1,0 +1,2 @@
+[console_scripts]
+vtt_to_srt = vtt_to_srt.vtt_to_srt:main
