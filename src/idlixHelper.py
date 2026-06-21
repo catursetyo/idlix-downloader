@@ -6,7 +6,6 @@ Author  :   sandroputraa
 """
 
 import os
-import re
 import json
 import time
 import m3u8
@@ -16,11 +15,9 @@ import requests
 import subprocess
 import m3u8_To_MP4
 from loguru import logger
-from bs4 import BeautifulSoup
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 from vtt_to_srt.vtt_to_srt import ConvertFile
 from curl_cffi import requests as cffi_requests
-from src.CryptoJsAesHelper import CryptoJsAes, dec
 
 
 class IdlixHelper:
@@ -45,7 +42,6 @@ class IdlixHelper:
     def __init__(self):
         self.base_web_url = self.BASE_WEB_URL
         self.api_base_url = urljoin(self.base_web_url, "api")
-        self.provider = None
         self.content_type = "movie"
         self.poster = None
         self.m3u8_url = None
@@ -55,7 +51,6 @@ class IdlixHelper:
         self.is_subtitle = None
         self.variant_playlist = None
         self.next_subtitles = []
-        self.max_height = None
         self.request = cffi_requests.Session(
             impersonate="chrome124",
             headers=self.BASE_STATIC_HEADERS,
@@ -146,13 +141,11 @@ class IdlixHelper:
         return f"{round(bandwidth / 1000)} Kbps"
 
     @staticmethod
-    def _parse_next_route(path):
+    def _parse_movie_route(path):
         parts = [part for part in path.split("/") if part]
         if len(parts) >= 2 and parts[0] == "movie":
-            return "movie", parts[1]
-        if len(parts) >= 2 and parts[0] in ("series", "tv-series"):
-            return "tv_series", parts[1]
-        return None, None
+            return parts[1]
+        return None
 
     def _set_base_url(self, url):
         origin = self._origin_from_url(url)
@@ -235,7 +228,6 @@ class IdlixHelper:
 
     def _resolve_next_movie(self, url, slug):
         data = self._api_get(f"/movies/{slug}", referer=url)
-        self.provider = "next"
         self.content_type = "movie"
         self.video_id = data.get("id")
         self.video_name = self._build_video_name(data)
@@ -331,7 +323,6 @@ class IdlixHelper:
             redeemed = self._redeem_pentos(play_info)
             self.m3u8_url = redeemed["url"]
             self.next_subtitles = redeemed.get("subtitles") or []
-            self.max_height = play_info.get("maxHeight")
             self.variant_playlist = m3u8.load(self.m3u8_url)
             tmp_variant_playlist = self._playlist_variants(self.variant_playlist)
 
@@ -350,67 +341,31 @@ class IdlixHelper:
     def get_home(self):
         try:
             self._set_base_url(self.BASE_WEB_URL)
-            try:
-                data = self._api_get("/movies?limit=20", referer=self.base_web_url)
-                movies = data.get("data", data if isinstance(data, list) else [])
-                tmp_featured = []
-                for movie in movies:
-                    if movie.get("contentType") not in (None, "movie"):
-                        continue
-                    slug = movie.get("slug")
-                    if not slug:
-                        continue
-                    year = self._year_from_date(movie.get("releaseDate"))
-                    tmp_featured.append({
-                        "url": urljoin(self.base_web_url, f"/movie/{slug}"),
-                        "title": movie.get("title") or slug,
-                        "year": year,
-                        "type": "movie",
-                        "poster": self._tmdb_image_url(movie.get("posterPath")),
-                    })
-                if tmp_featured:
-                    return {
-                        'status': True,
-                        'featured_movie': tmp_featured
-                    }
-            except Exception:
-                pass
-
-            request = self.request.get(
-                url=self.base_web_url,
-                headers=self._headers(referer=self.base_web_url),
-                timeout=10
-            )
-            if request.status_code == 200:
-                bs = BeautifulSoup(request.text, 'html.parser')
-                tmp_featured = []
-                featured_container = bs.find('div', {'class': 'items featured'})
-                if not featured_container:
-                    return {
-                        'status': False,
-                        'message': 'Featured movie list not found'
-                    }
-                for featured in featured_container.find_all('article'):
-
-                    if featured.find('a').get('href').split('/')[3] == 'tvseries':
-                        continue
-
-                    tmp_featured.append({
-                        "url": featured.find('a').get('href'),
-                        "title": featured.find('h3').text,
-                        "year": featured.find('span').text,
-                        "type": featured.find('a').get('href').split('/')[3],
-                        "poster": featured.find('img').get('src'),
-                    })
+            data = self._api_get("/movies?limit=20", referer=self.base_web_url)
+            movies = data.get("data", data if isinstance(data, list) else [])
+            tmp_featured = []
+            for movie in movies:
+                if movie.get("contentType") not in (None, "movie"):
+                    continue
+                slug = movie.get("slug")
+                if not slug:
+                    continue
+                tmp_featured.append({
+                    "url": urljoin(self.base_web_url, f"/movie/{slug}"),
+                    "title": movie.get("title") or slug,
+                    "year": self._year_from_date(movie.get("releaseDate")),
+                    "type": "movie",
+                    "poster": self._tmdb_image_url(movie.get("posterPath")),
+                })
+            if tmp_featured:
                 return {
                     'status': True,
                     'featured_movie': tmp_featured
                 }
-            else:
-                return {
-                    'status': False,
-                    'message': 'Failed to get home page'
-                }
+            return {
+                'status': False,
+                'message': 'Featured movie list not found'
+            }
         except Exception as error_get_home:
             return {
                 'status': False,
@@ -431,47 +386,8 @@ class IdlixHelper:
             }
 
         self._set_base_url(url)
-        request = self.request.get(
-            url=url,
-            headers=self._headers(referer=self.base_web_url),
-            timeout=30,
-        )
-        if request.status_code != 200:
-            return {
-                'status': False,
-                'message': f'Failed to get video data: HTTP {request.status_code}'
-            }
-
-        bs = BeautifulSoup(request.text, 'html.parser')
-        dooplay_counter = bs.find('meta', {'id': 'dooplay-ajax-counter'})
-        if dooplay_counter:
-            request = self.request.get(
-                url=url,
-                headers=self._headers(referer=self.base_web_url),
-            )
-            if request.status_code == 200:
-                bs = BeautifulSoup(request.text, 'html.parser')
-                self.provider = "dooplay"
-                self.content_type = "movie"
-                self.video_id = bs.find('meta', {'id': 'dooplay-ajax-counter'}).get('data-postid')
-                name_meta = bs.find('meta', {'itemprop': 'name'})
-                image_meta = bs.find('img', {'itemprop': 'image'})
-                self.video_name = unquote(name_meta.get('content')) if name_meta else "IDLIX Video"
-                self.poster = image_meta.get('src') if image_meta else None
-                return {
-                    'status': True,
-                    'video_id': self.video_id,
-                    'video_name': self.video_name,
-                    'poster': self.poster
-                }
-            else:
-                return {
-                    'status': False,
-                    'message': 'Failed to get video data'
-                }
-
-        content_type, slug = self._parse_next_route(parsed.path)
-        if content_type == "movie" and slug:
+        slug = self._parse_movie_route(parsed.path)
+        if slug:
             try:
                 return self._resolve_next_movie(url, slug)
             except Exception as error_resolve_next_movie:
@@ -482,7 +398,7 @@ class IdlixHelper:
 
         return {
             'status': False,
-            'message': 'Unsupported URL. Only movie URLs are supported for the new IDLIX structure'
+            'message': 'Unsupported URL. Only movie URLs are supported'
         }
 
     def get_embed_url(self):
@@ -492,52 +408,14 @@ class IdlixHelper:
                 'message': 'Video ID is required'
             }
 
-        if self.provider == "next":
-            self.embed_url = urljoin(
-                self.base_web_url,
-                f"api/watch/play-info/{self.content_type}/{self.video_id}"
-            )
-            return {
-                'status': True,
-                'embed_url': self.embed_url
-            }
-
-        try:
-            request = self.request.post(
-                url=urljoin(self.base_web_url, "wp-admin/admin-ajax.php"),
-                headers=self._headers(
-                    referer=self.base_web_url,
-                    content_type="application/x-www-form-urlencoded; charset=UTF-8"
-                ),
-                data={
-                    "action": "doo_player_ajax",
-                    "post": self.video_id,
-                    "nume": "1",
-                    "type": "movie",
-                }
-            )
-            if request.status_code == 200 and request.json().get('embed_url'):
-                self.embed_url = CryptoJsAes.decrypt(
-                    request.json().get('embed_url'),
-                    dec(
-                        request.json().get('key'),
-                        json.loads(request.json().get('embed_url')).get('m')
-                    )
-                )
-                return {
-                    'status': True,
-                    'embed_url': self.embed_url
-                }
-            else:
-                return {
-                    'status': False,
-                    'message': 'Failed to get embed URL'
-                }
-        except Exception as error_get_embed_url:
-            return {
-                'status': False,
-                'message': str(error_get_embed_url)
-            }
+        self.embed_url = urljoin(
+            self.base_web_url,
+            f"api/watch/play-info/{self.content_type}/{self.video_id}"
+        )
+        return {
+            'status': True,
+            'embed_url': self.embed_url
+        }
 
     def get_m3u8_url(self):
         if not self.embed_url:
@@ -546,54 +424,7 @@ class IdlixHelper:
                 'message': 'Embed URL is required'
             }
 
-        if self.provider == "next":
-            return self._get_next_m3u8_url()
-
-        if '/video/' in urlparse(self.embed_url).path:
-            self.embed_url = urlparse(self.embed_url).path.split('/')[2]
-        elif "=" in urlparse(self.embed_url).query:
-            self.embed_url = urlparse(self.embed_url).query.split('=')[1]
-
-        try:
-            request = cffi_requests.post(
-                url='https://jeniusplay.com/player/index.php',
-                params={
-                    "data": self.embed_url,
-                    "do": "getVideo"
-                },
-                headers={
-                    "Host": "jeniusplay.com",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                },
-                data={
-                    "hash": self.embed_url,
-                    "r": self.base_web_url,
-                },
-                impersonate="chrome",
-            )
-
-            if request.status_code == 200 and request.json().get('videoSource'):
-                self.m3u8_url = request.json().get('videoSource').rsplit(".", 1)[0] + ".m3u8"
-                self.variant_playlist = m3u8.load(self.m3u8_url)
-                tmp_variant_playlist = self._playlist_variants(self.variant_playlist)
-                is_variant_playlist = True if len(tmp_variant_playlist) > 1 else False
-                return {
-                    'status': True,
-                    'm3u8_url': self.m3u8_url,
-                    'variant_playlist': tmp_variant_playlist,
-                    'is_variant_playlist': is_variant_playlist
-                }
-            else:
-                return {
-                    'status': False,
-                    'message': 'Failed to get m3u8 URL'
-                }
-        except Exception as error_get_m3u8_url:
-            return {
-                'status': False,
-                'message': str(error_get_m3u8_url)
-            }
+        return self._get_next_m3u8_url()
 
     def download_m3u8(self):
         try:
@@ -626,110 +457,59 @@ class IdlixHelper:
 
     def get_subtitle(self, download=True):
         try:
-            if self.provider == "next":
-                if not self.next_subtitles:
-                    self.is_subtitle = False
-                    return {
-                        'status': False,
-                        'message': 'Subtitle not found'
-                    }
-
-                subtitle = next(
-                    (
-                        item for item in self.next_subtitles
-                        if item.get("lang") == "id" or "indonesian" in item.get("label", "").lower()
-                    ),
-                    self.next_subtitles[0],
-                )
-                subtitle_url = subtitle.get("path")
-                if not subtitle_url:
-                    self.is_subtitle = False
-                    return {
-                        'status': False,
-                        'message': 'Subtitle URL not found'
-                    }
-
-                if not download:
-                    self.is_subtitle = True
-                    return {
-                        'status': True,
-                        'subtitle': subtitle_url
-                    }
-
-                subtitle_request = self.request.get(
-                    url=subtitle_url,
-                    headers=self._headers(
-                        referer=self.m3u8_url or self.base_web_url,
-                        accept="text/vtt,*/*"
-                    ),
-                    timeout=30,
-                )
-                if subtitle_request.status_code != 200:
-                    self.is_subtitle = False
-                    return {
-                        'status': False,
-                        'message': f'Failed to download subtitle: HTTP {subtitle_request.status_code}'
-                    }
-
-                subtitle_base = self.video_name.replace(" ", "_")
-                with open(subtitle_base + '.vtt', 'wb') as subtitle_file:
-                    subtitle_file.write(subtitle_request.content)
-                self.convert_vtt_to_srt(subtitle_base + '.vtt')
-                self.is_subtitle = True
-                return {
-                    'status': True,
-                    'subtitle': subtitle_base + '.srt',
-                }
-
-            if not self.embed_url:
-                return {
-                    'status': False,
-                    'message': 'Embed URL is required'
-                }
-
-            request = cffi_requests.post(
-                url='https://jeniusplay.com/player/index.php',
-                params={
-                    "data": self.embed_url,
-                    "do": "getVideo"
-                },
-                headers={
-                    "Host": "jeniusplay.com",
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                },
-                data={
-                    "hash": self.embed_url,
-                    "r": self.base_web_url
-                },
-                impersonate="chrome",
-
-            )
-            regex_subtitle = re.search(r"var playerjsSubtitle = \"(.*)\";", request.text)
-            if regex_subtitle:
-                if download:
-                    subtitle_request = requests.get(
-                        url="https://" + regex_subtitle.group(1).split("https://")[1],
-                    )
-                    with open(self.video_name.replace(" ", "_") + '.vtt', 'wb') as subtitle_file:
-                        subtitle_file.write(subtitle_request.content)
-                    self.convert_vtt_to_srt(self.video_name.replace(" ", "_") + '.vtt')
-                    self.is_subtitle = True
-                    return {
-                        'status': True,
-                        'subtitle': self.video_name.replace(" ", "_") + '.srt',
-                    }
-
-                self.is_subtitle = True
-                return {
-                    'status': True,
-                    'subtitle': "https://" + regex_subtitle.group(1).split("https://")[1]
-                }
-            else:
+            if not self.next_subtitles:
                 self.is_subtitle = False
                 return {
                     'status': False,
                     'message': 'Subtitle not found'
                 }
+
+            subtitle = next(
+                (
+                    item for item in self.next_subtitles
+                    if item.get("lang") == "id" or "indonesian" in item.get("label", "").lower()
+                ),
+                self.next_subtitles[0],
+            )
+            subtitle_url = subtitle.get("path")
+            if not subtitle_url:
+                self.is_subtitle = False
+                return {
+                    'status': False,
+                    'message': 'Subtitle URL not found'
+                }
+
+            if not download:
+                self.is_subtitle = True
+                return {
+                    'status': True,
+                    'subtitle': subtitle_url
+                }
+
+            subtitle_request = self.request.get(
+                url=subtitle_url,
+                headers=self._headers(
+                    referer=self.m3u8_url or self.base_web_url,
+                    accept="text/vtt,*/*"
+                ),
+                timeout=30,
+            )
+            if subtitle_request.status_code != 200:
+                self.is_subtitle = False
+                return {
+                    'status': False,
+                    'message': f'Failed to download subtitle: HTTP {subtitle_request.status_code}'
+                }
+
+            subtitle_base = self.video_name.replace(" ", "_")
+            with open(subtitle_base + '.vtt', 'wb') as subtitle_file:
+                subtitle_file.write(subtitle_request.content)
+            self.convert_vtt_to_srt(subtitle_base + '.vtt')
+            self.is_subtitle = True
+            return {
+                'status': True,
+                'subtitle': subtitle_base + '.srt',
+            }
         except Exception as error_get_subtitle:
             return {
                 'status': False,
@@ -793,5 +573,3 @@ class IdlixHelper:
             self.m3u8_url = m3u8_url
         elif self.m3u8_url:
             self.m3u8_url = urljoin(self.m3u8_url, m3u8_url)
-        else:
-            self.m3u8_url = urljoin("https://jeniusplay.com", m3u8_url)

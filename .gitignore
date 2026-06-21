@@ -1,1 +1,16 @@
 .venv/
+__pycache__/
+*.py[cod]
+
+tmp/
+dist/
+build/
+release/
+*.spec
+
+*.mp4
+*.mkv
+*.srt
+*.vtt
+ffmpeg-release-essentials.zip
+src/ffmpeg/

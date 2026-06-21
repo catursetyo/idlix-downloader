@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, simpledialog
 import threading
 import subprocess
 import os
@@ -9,7 +9,6 @@ from io import BytesIO
 
 from PIL import Image, ImageTk
 import requests
-from bs4 import BeautifulSoup
 
 from src.idlixHelper import IdlixHelper, logger
 
