@@ -8,11 +8,10 @@ RETRY_LIMIT = 3
 
 
 def retry(func, *args, **kwargs):
-    last_result = None
+    result = None
 
     for i in range(RETRY_LIMIT):
         result = func(*args, **kwargs)
-        last_result = result
 
         if result and result.get("status"):
             return result
@@ -26,7 +25,7 @@ def retry(func, *args, **kwargs):
 
     return {
         "status": False,
-        "message": (last_result or {}).get("message", "Maximum retry reached")
+        "message": (result or {}).get("message", "Maximum retry reached")
     }
 
 
