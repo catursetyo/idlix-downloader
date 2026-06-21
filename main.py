@@ -16,12 +16,14 @@ def retry(func, *args, **kwargs):
         if result and result.get("status"):
             return result
 
+        result_message = result.get("message", "No result") if result else "No result"
+
         if result:
-            error_message = result.get("message", error_message)
+            error_message = result_message
 
         logger.warning(
             f"Retry {i + 1}/{RETRY_LIMIT} failed: "
-            f"{result.get('message') if result else 'No result'}"
+            f"{result_message}"
         )
 
         time.sleep(1)
