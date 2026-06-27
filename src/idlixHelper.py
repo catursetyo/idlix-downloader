@@ -14,6 +14,7 @@ import shutil
 import zipfile
 import requests
 import subprocess
+import threading
 from loguru import logger
 from urllib.parse import urljoin, urlparse
 from vtt_to_srt.vtt_to_srt import ConvertFile
@@ -186,6 +187,33 @@ class IdlixHelper:
         return f"{round(bandwidth / 1000)} Kbps"
 
     @staticmethod
+    def _format_bytes(size):
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            return "0 B"
+
+        units = ["B", "KB", "MB", "GB", "TB"]
+        value = float(size)
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                if unit == "B":
+                    return f"{int(value)} {unit}"
+                return f"{value:.1f} {unit}"
+            value /= 1024
+
+    @staticmethod
+    def _format_seconds(seconds):
+        try:
+            seconds = max(0, int(seconds))
+        except (TypeError, ValueError):
+            seconds = 0
+
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    @staticmethod
     def _parse_movie_route(path):
         parts = [part for part in path.split("/") if part]
         if len(parts) >= 2 and parts[0] == "movie":
@@ -278,6 +306,120 @@ class IdlixHelper:
                 "id": str(index),
             })
         return variants
+
+    def _playlist_duration_seconds(self):
+        try:
+            parsed = urlparse(self.m3u8_url)
+            if parsed.scheme in ("http", "https"):
+                response = self.request.get(
+                    url=self.m3u8_url,
+                    headers=self._headers(
+                        referer=self.embed_url or self.base_web_url,
+                        accept="*/*",
+                    ),
+                    timeout=30,
+                )
+                if response.status_code < 200 or response.status_code >= 300:
+                    return None
+                playlist = m3u8.loads(response.text, uri=self.m3u8_url)
+            elif parsed.scheme == "file":
+                playlist = m3u8.load(parsed.path)
+            else:
+                playlist = m3u8.load(self.m3u8_url)
+
+            if playlist.is_variant:
+                return None
+
+            duration = sum(segment.duration or 0 for segment in playlist.segments)
+            return duration if duration > 0 else None
+        except Exception:
+            return None
+
+    def _log_download_progress(self, progress, duration):
+        out_time_ms = progress.get("out_time_ms")
+        total_size = progress.get("total_size")
+        speed = progress.get("speed") or "N/A"
+
+        try:
+            seconds_done = max(0, int(out_time_ms or 0) / 1_000_000)
+        except ValueError:
+            seconds_done = 0
+
+        size_label = self._format_bytes(total_size)
+        done_label = self._format_seconds(seconds_done)
+
+        if duration:
+            percent = min(100, (seconds_done / duration) * 100)
+            logger.info(
+                "Download progress: "
+                f"{percent:5.1f}% | {done_label}/{self._format_seconds(duration)} "
+                f"| {size_label} | speed {speed}"
+            )
+            return
+
+        logger.info(
+            "Download progress: "
+            f"{done_label} processed | {size_label} | speed {speed}"
+        )
+
+    def _log_download_complete(self, duration, output_path):
+        size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+        size_label = self._format_bytes(size)
+        if duration:
+            duration_label = self._format_seconds(duration)
+            logger.info(
+                "Download progress: "
+                f"100.0% | {duration_label}/{duration_label} | {size_label} | finished"
+            )
+            return
+
+        logger.info(f"Download finished: {size_label}")
+
+    def _run_ffmpeg_download(self, command, duration, output_path):
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        stderr_lines = []
+
+        def collect_stderr():
+            for line in process.stderr:
+                line = line.strip()
+                if line:
+                    stderr_lines.append(line)
+
+        stderr_thread = threading.Thread(target=collect_stderr, daemon=True)
+        stderr_thread.start()
+
+        progress = {}
+        for line in process.stdout:
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            progress[key] = value
+            if key == "progress":
+                self._log_download_progress(progress, duration)
+                progress = {}
+
+        return_code = process.wait()
+        stderr_thread.join(timeout=1)
+        if return_code == 0:
+            self._log_download_complete(duration, output_path)
+            return {
+                "status": True,
+                "message": "Download success",
+                "path": output_path,
+            }
+
+        return {
+            "status": False,
+            "message": "\n".join(stderr_lines)[-1000:] or f"ffmpeg exited with code {return_code}",
+        }
 
     def _resolve_next_movie(self, url, slug):
         data = self._api_get(f"/movies/{slug}", referer=url)
@@ -500,6 +642,9 @@ class IdlixHelper:
             output_path = self._unique_output_path(output_dir, output_stem, ".mp4")
 
             logger.info(f"Downloading with ffmpeg: {output_path}")
+            duration = self._playlist_duration_seconds()
+            if duration:
+                logger.info(f"Playlist duration: {self._format_seconds(duration)}")
             command = [
                 ffmpeg_path,
                 "-y",
@@ -507,6 +652,10 @@ class IdlixHelper:
                 "-hide_banner",
                 "-loglevel",
                 "warning",
+                "-stats_period",
+                "1",
+                "-progress",
+                "pipe:1",
             ]
             command.extend(self._hls_demuxer_options())
             if urlparse(self.m3u8_url).scheme in ("http", "https"):
@@ -528,20 +677,11 @@ class IdlixHelper:
                 output_path,
             ])
 
-            completed = subprocess.run(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            if completed.returncode != 0:
-                error_output = (completed.stderr or completed.stdout or "").strip()
+            result = self._run_ffmpeg_download(command, duration, output_path)
+            if not result.get("status"):
                 if os.path.exists(output_path) and os.path.getsize(output_path) == 0:
                     os.remove(output_path)
-                return {
-                    'status': False,
-                    'message': error_output[-1000:] or f'ffmpeg exited with code {completed.returncode}'
-                }
+                return result
 
             if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
                 return {
@@ -549,11 +689,7 @@ class IdlixHelper:
                     'message': 'ffmpeg finished but did not create a valid MP4 file'
                 }
 
-            return {
-                'status': True,
-                'message': 'Download success',
-                'path': output_path
-            }
+            return result
         except Exception as error_download_m3u8:
             return {
                 'status': False,
