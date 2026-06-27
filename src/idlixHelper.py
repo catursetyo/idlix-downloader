@@ -117,6 +117,19 @@ class IdlixHelper:
         raise RuntimeError(f"Unable to create a unique output file for {stem}{suffix}")
 
     @staticmethod
+    def _hls_demuxer_options():
+        return [
+            "-protocol_whitelist",
+            "file,http,https,tcp,tls,crypto,data",
+            "-allowed_extensions",
+            "ALL",
+            "-allowed_segment_extensions",
+            "ALL",
+            "-extension_picky",
+            "0",
+        ]
+
+    @staticmethod
     def download_ffmpeg():
         try:
             logger.info('Downloading ffmpeg')
@@ -145,6 +158,18 @@ class IdlixHelper:
         if not parsed.scheme or not parsed.netloc:
             return None
         return f"{parsed.scheme}://{parsed.netloc}/"
+
+    @staticmethod
+    def _normalize_url(url):
+        url = (url or "").strip()
+        if not url:
+            return url
+        if url.startswith("//"):
+            return f"https:{url}"
+        parsed = urlparse(url)
+        if parsed.scheme:
+            return url
+        return f"https://{url}"
 
     @staticmethod
     def _year_from_date(value):
@@ -401,6 +426,7 @@ class IdlixHelper:
             }
 
     def get_video_data(self, url):
+        url = self._normalize_url(url)
         if not url:
             return {
                 'status': False,
@@ -481,11 +507,8 @@ class IdlixHelper:
                 "-hide_banner",
                 "-loglevel",
                 "warning",
-                "-protocol_whitelist",
-                "file,http,https,tcp,tls,crypto,data",
-                "-allowed_extensions",
-                "ALL",
             ]
+            command.extend(self._hls_demuxer_options())
             if urlparse(self.m3u8_url).scheme in ("http", "https"):
                 command.extend([
                     "-headers",
@@ -615,6 +638,7 @@ class IdlixHelper:
             if self.is_subtitle:
                 subprocess.call([
                     ffplay_path,
+                    *self._hls_demuxer_options(),
                     "-i",
                     self.m3u8_url,
                     "-window_title",
@@ -628,6 +652,7 @@ class IdlixHelper:
             else:
                 subprocess.call([
                     ffplay_path,
+                    *self._hls_demuxer_options(),
                     "-i",
                     self.m3u8_url,
                     "-window_title",

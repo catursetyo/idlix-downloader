@@ -402,7 +402,16 @@ class IdlixGUI:
             logger.error("ffplay not found. Please install ffmpeg first.")
             return
 
-        args = [ffplay_path, "-i", m3u8_url, "-window_title", title, "-loglevel", "panic"]
+        args = [
+            ffplay_path,
+            *IdlixHelper._hls_demuxer_options(),
+            "-i",
+            m3u8_url,
+            "-window_title",
+            title,
+            "-loglevel",
+            "panic",
+        ]
 
         if subtitle:
             args += ["-vf", f"subtitles={subtitle}"]
