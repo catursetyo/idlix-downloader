@@ -54,6 +54,7 @@ class IdlixHelper:
         self.next_subtitles = []
         self.ffmpeg_path = shutil.which("ffmpeg")
         self.ffplay_path = shutil.which("ffplay")
+        self.ytdlp_path = shutil.which("yt-dlp")
         self.request = cffi_requests.Session(
             impersonate="chrome124",
             headers=self.BASE_STATIC_HEADERS,
@@ -129,6 +130,14 @@ class IdlixHelper:
             "-extension_picky",
             "0",
         ]
+
+    @staticmethod
+    def _concurrent_fragments():
+        try:
+            value = int(os.environ.get("IDLIX_CONCURRENT_FRAGMENTS", "8"))
+        except ValueError:
+            value = 8
+        return min(max(value, 1), 32)
 
     @staticmethod
     def download_ffmpeg():
@@ -252,6 +261,15 @@ class IdlixHelper:
         headers["Origin"] = self.base_web_url.rstrip("/")
         return "".join(f"{key}: {value}\r\n" for key, value in headers.items() if value)
 
+    def _download_headers(self):
+        return {
+            "User-Agent": self.BASE_STATIC_HEADERS["User-Agent"],
+            "Referer": self.embed_url or self.base_web_url,
+            "Origin": self.base_web_url.rstrip("/"),
+            "Accept": "*/*",
+            "Accept-Language": self.BASE_STATIC_HEADERS["Accept-Language"],
+        }
+
     def _api_url(self, path):
         if path.startswith("http://") or path.startswith("https://"):
             return path
@@ -307,35 +325,7 @@ class IdlixHelper:
             })
         return variants
 
-    def _playlist_duration_seconds(self):
-        try:
-            parsed = urlparse(self.m3u8_url)
-            if parsed.scheme in ("http", "https"):
-                response = self.request.get(
-                    url=self.m3u8_url,
-                    headers=self._headers(
-                        referer=self.embed_url or self.base_web_url,
-                        accept="*/*",
-                    ),
-                    timeout=30,
-                )
-                if response.status_code < 200 or response.status_code >= 300:
-                    return None
-                playlist = m3u8.loads(response.text, uri=self.m3u8_url)
-            elif parsed.scheme == "file":
-                playlist = m3u8.load(parsed.path)
-            else:
-                playlist = m3u8.load(self.m3u8_url)
-
-            if playlist.is_variant:
-                return None
-
-            duration = sum(segment.duration or 0 for segment in playlist.segments)
-            return duration if duration > 0 else None
-        except Exception:
-            return None
-
-    def _log_download_progress(self, progress, duration):
+    def _log_download_progress(self, progress):
         out_time_ms = progress.get("out_time_ms")
         total_size = progress.get("total_size")
         speed = progress.get("speed") or "N/A"
@@ -348,34 +338,17 @@ class IdlixHelper:
         size_label = self._format_bytes(total_size)
         done_label = self._format_seconds(seconds_done)
 
-        if duration:
-            percent = min(100, (seconds_done / duration) * 100)
-            logger.info(
-                "Download progress: "
-                f"{percent:5.1f}% | {done_label}/{self._format_seconds(duration)} "
-                f"| {size_label} | speed {speed}"
-            )
-            return
-
         logger.info(
             "Download progress: "
             f"{done_label} processed | {size_label} | speed {speed}"
         )
 
-    def _log_download_complete(self, duration, output_path):
+    def _log_download_complete(self, output_path):
         size = os.path.getsize(output_path) if os.path.exists(output_path) else 0
         size_label = self._format_bytes(size)
-        if duration:
-            duration_label = self._format_seconds(duration)
-            logger.info(
-                "Download progress: "
-                f"100.0% | {duration_label}/{duration_label} | {size_label} | finished"
-            )
-            return
+        logger.info(f"Download progress: 100.0% | {size_label} | finished")
 
-        logger.info(f"Download finished: {size_label}")
-
-    def _run_ffmpeg_download(self, command, duration, output_path):
+    def _run_ffmpeg_download(self, command, output_path):
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -403,13 +376,13 @@ class IdlixHelper:
             key, value = line.split("=", 1)
             progress[key] = value
             if key == "progress":
-                self._log_download_progress(progress, duration)
+                self._log_download_progress(progress)
                 progress = {}
 
         return_code = process.wait()
         stderr_thread.join(timeout=1)
         if return_code == 0:
-            self._log_download_complete(duration, output_path)
+            self._log_download_complete(output_path)
             return {
                 "status": True,
                 "message": "Download success",
@@ -420,6 +393,117 @@ class IdlixHelper:
             "status": False,
             "message": "\n".join(stderr_lines)[-1000:] or f"ffmpeg exited with code {return_code}",
         }
+
+    def _run_ytdlp_download(self, command, output_path):
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        output_lines = []
+
+        for line in process.stdout:
+            line = line.strip()
+            if not line:
+                continue
+
+            output_lines.append(line)
+            if line.startswith("[download]"):
+                logger.info(f"Download progress: {line.removeprefix('[download]').strip()}")
+            elif line.startswith("[hlsnative]") or line.startswith("[FixupM3u8]"):
+                logger.info(line)
+            elif line.startswith("ERROR:"):
+                logger.error(line)
+
+        return_code = process.wait()
+        if return_code == 0:
+            self._log_download_complete(output_path)
+            return {
+                "status": True,
+                "message": "Download success",
+                "path": output_path,
+            }
+
+        return {
+            "status": False,
+            "message": "\n".join(output_lines)[-1000:] or f"yt-dlp exited with code {return_code}",
+        }
+
+    def _download_m3u8_ytdlp(self, output_path):
+        if not self.ytdlp_path:
+            return {
+                "status": False,
+                "message": "yt-dlp not found",
+            }
+
+        fragments = self._concurrent_fragments()
+        logger.info(f"Downloading with yt-dlp: {output_path}")
+        logger.info(f"Concurrent HLS fragments: {fragments}")
+        command = [
+            self.ytdlp_path,
+            "--hls-prefer-native",
+            "--concurrent-fragments",
+            str(fragments),
+            "--fragment-retries",
+            "10",
+            "--newline",
+            "--no-warnings",
+            "--no-part",
+            "--force-overwrites",
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            output_path,
+        ]
+        for key, value in self._download_headers().items():
+            command.extend(["--add-headers", f"{key}:{value}"])
+
+        command.append(self.m3u8_url)
+        return self._run_ytdlp_download(command, output_path)
+
+    def _download_m3u8_ffmpeg(self, output_path):
+        ffmpeg_path = self.ffmpeg_path or shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            return {
+                'status': False,
+                'message': 'FFMPEG not found, please install ffmpeg first'
+            }
+
+        logger.info(f"Downloading with ffmpeg: {output_path}")
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-stats_period",
+            "1",
+            "-progress",
+            "pipe:1",
+        ]
+        command.extend(self._hls_demuxer_options())
+        if urlparse(self.m3u8_url).scheme in ("http", "https"):
+            command.extend([
+                "-headers",
+                self._ffmpeg_headers(),
+            ])
+        command.extend([
+            "-i",
+            self.m3u8_url,
+            "-map",
+            "0:v:0?",
+            "-map",
+            "0:a:0?",
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            output_path,
+        ])
+        return self._run_ffmpeg_download(command, output_path)
 
     def _resolve_next_movie(self, url, slug):
         data = self._api_get(f"/movies/{slug}", referer=url)
@@ -630,58 +714,18 @@ class IdlixHelper:
                     'message': 'M3U8 URL is required'
                 }
 
-            ffmpeg_path = self.ffmpeg_path or shutil.which("ffmpeg")
-            if not ffmpeg_path:
-                return {
-                    'status': False,
-                    'message': 'FFMPEG not found, please install ffmpeg first'
-                }
-
             output_dir = os.path.abspath(os.getcwd())
             output_stem = self._safe_file_stem(self.video_name)
             output_path = self._unique_output_path(output_dir, output_stem, ".mp4")
 
-            logger.info(f"Downloading with ffmpeg: {output_path}")
-            duration = self._playlist_duration_seconds()
-            if duration:
-                logger.info(f"Playlist duration: {self._format_seconds(duration)}")
-            command = [
-                ffmpeg_path,
-                "-y",
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "warning",
-                "-stats_period",
-                "1",
-                "-progress",
-                "pipe:1",
-            ]
-            command.extend(self._hls_demuxer_options())
-            if urlparse(self.m3u8_url).scheme in ("http", "https"):
-                command.extend([
-                    "-headers",
-                    self._ffmpeg_headers(),
-                ])
-            command.extend([
-                "-i",
-                self.m3u8_url,
-                "-map",
-                "0:v:0?",
-                "-map",
-                "0:a:0?",
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                output_path,
-            ])
-
-            result = self._run_ffmpeg_download(command, duration, output_path)
+            result = self._download_m3u8_ytdlp(output_path)
             if not result.get("status"):
-                if os.path.exists(output_path) and os.path.getsize(output_path) == 0:
-                    os.remove(output_path)
-                return result
+                logger.warning(f"yt-dlp download failed, falling back to ffmpeg: {result.get('message')}")
+                result = self._download_m3u8_ffmpeg(output_path)
+                if not result.get("status"):
+                    if os.path.exists(output_path) and os.path.getsize(output_path) == 0:
+                        os.remove(output_path)
+                    return result
 
             if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
                 return {
