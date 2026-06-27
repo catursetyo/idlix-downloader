@@ -7,13 +7,13 @@ Author  :   sandroputraa
 
 import os
 import json
+import re
 import time
 import m3u8
 import shutil
 import zipfile
 import requests
 import subprocess
-import m3u8_To_MP4
 from loguru import logger
 from urllib.parse import urljoin, urlparse
 from vtt_to_srt.vtt_to_srt import ConvertFile
@@ -51,6 +51,8 @@ class IdlixHelper:
         self.is_subtitle = None
         self.variant_playlist = None
         self.next_subtitles = []
+        self.ffmpeg_path = shutil.which("ffmpeg")
+        self.ffplay_path = shutil.which("ffplay")
         self.request = cffi_requests.Session(
             impersonate="chrome124",
             headers=self.BASE_STATIC_HEADERS,
@@ -92,9 +94,27 @@ class IdlixHelper:
                 except Exception as e:
                     print(f'Error: {e}')
         else:
-            if not shutil.which('ffmpeg'):
+            if not self.ffmpeg_path:
                 logger.error('FFMPEG not found, please install ffmpeg first before running this script')
-                exit()
+
+    @staticmethod
+    def _safe_file_stem(value):
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value or "IDLIX Video")
+        stem = re.sub(r"\s+", " ", stem).strip().strip(".")
+        return stem[:180] or "IDLIX Video"
+
+    @staticmethod
+    def _unique_output_path(directory, stem, suffix):
+        path = os.path.join(directory, f"{stem}{suffix}")
+        if not os.path.exists(path):
+            return path
+
+        for index in range(1, 1000):
+            candidate = os.path.join(directory, f"{stem} ({index}){suffix}")
+            if not os.path.exists(candidate):
+                return candidate
+
+        raise RuntimeError(f"Unable to create a unique output file for {stem}{suffix}")
 
     @staticmethod
     def download_ffmpeg():
@@ -170,6 +190,14 @@ class IdlixHelper:
         )
         headers["Origin"] = self.base_web_url.rstrip("/")
         return headers
+
+    def _ffmpeg_headers(self):
+        headers = self._headers(
+            referer=self.embed_url or self.base_web_url,
+            accept="*/*",
+        )
+        headers["Origin"] = self.base_web_url.rstrip("/")
+        return "".join(f"{key}: {value}\r\n" for key, value in headers.items() if value)
 
     def _api_url(self, path):
         if path.startswith("http://") or path.startswith("https://"):
@@ -433,21 +461,75 @@ class IdlixHelper:
                     'status': False,
                     'message': 'M3U8 URL is required'
                 }
-            if not os.path.exists(os.getcwd() + '/tmp/'):
-                os.mkdir(os.getcwd() + '/tmp/')
 
-            m3u8_To_MP4.multithread_download(
-                m3u8_uri=self.m3u8_url,
-                max_num_workers=10,
-                mp4_file_name=self.video_name,
-                mp4_file_dir=os.getcwd() + '/',
-                tmpdir=os.getcwd() + '/tmp/'
+            ffmpeg_path = self.ffmpeg_path or shutil.which("ffmpeg")
+            if not ffmpeg_path:
+                return {
+                    'status': False,
+                    'message': 'FFMPEG not found, please install ffmpeg first'
+                }
+
+            output_dir = os.path.abspath(os.getcwd())
+            output_stem = self._safe_file_stem(self.video_name)
+            output_path = self._unique_output_path(output_dir, output_stem, ".mp4")
+
+            logger.info(f"Downloading with ffmpeg: {output_path}")
+            command = [
+                ffmpeg_path,
+                "-y",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-protocol_whitelist",
+                "file,http,https,tcp,tls,crypto,data",
+                "-allowed_extensions",
+                "ALL",
+            ]
+            if urlparse(self.m3u8_url).scheme in ("http", "https"):
+                command.extend([
+                    "-headers",
+                    self._ffmpeg_headers(),
+                ])
+            command.extend([
+                "-i",
+                self.m3u8_url,
+                "-map",
+                "0:v:0?",
+                "-map",
+                "0:a:0?",
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                output_path,
+            ])
+
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
-            shutil.rmtree(os.getcwd() + '/tmp/', ignore_errors=True)
+            if completed.returncode != 0:
+                error_output = (completed.stderr or completed.stdout or "").strip()
+                if os.path.exists(output_path) and os.path.getsize(output_path) == 0:
+                    os.remove(output_path)
+                return {
+                    'status': False,
+                    'message': error_output[-1000:] or f'ffmpeg exited with code {completed.returncode}'
+                }
+
+            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+                return {
+                    'status': False,
+                    'message': 'ffmpeg finished but did not create a valid MP4 file'
+                }
+
             return {
                 'status': True,
                 'message': 'Download success',
-                'path': os.getcwd() + '/' + self.video_name + '.mp4'
+                'path': output_path
             }
         except Exception as error_download_m3u8:
             return {
@@ -523,10 +605,16 @@ class IdlixHelper:
                     'status': False,
                     'message': 'M3U8 URL is required'
                 }
+            ffplay_path = self.ffplay_path or shutil.which("ffplay")
+            if not ffplay_path:
+                return {
+                    'status': False,
+                    'message': 'FFPLAY not found, please install ffmpeg first'
+                }
 
             if self.is_subtitle:
                 subprocess.call([
-                    "ffplay",
+                    ffplay_path,
                     "-i",
                     self.m3u8_url,
                     "-window_title",
@@ -537,17 +625,17 @@ class IdlixHelper:
                     "-loglevel",
                     "panic"
                 ])
-
-            subprocess.call([
-                "ffplay",
-                "-i",
-                self.m3u8_url,
-                "-window_title",
-                self.video_name,
-                "-hide_banner",
-                "-loglevel",
-                "panic"
-            ])
+            else:
+                subprocess.call([
+                    ffplay_path,
+                    "-i",
+                    self.m3u8_url,
+                    "-window_title",
+                    self.video_name,
+                    "-hide_banner",
+                    "-loglevel",
+                    "panic"
+                ])
 
             if self.is_subtitle and os.path.exists(self.video_name.replace(" ", "_") + '.srt'):
                 os.remove(self.video_name.replace(" ", "_") + '.srt')

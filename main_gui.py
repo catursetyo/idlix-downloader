@@ -1,5 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, simpledialog
+import queue
+import shutil
 import threading
 import subprocess
 import os
@@ -31,14 +33,12 @@ def retry(func, *args, **kwargs):
 # GUI LOGGER
 # ============================================================
 class GuiLogger:
-    def __init__(self, textbox):
-        self.textbox = textbox
+    def __init__(self, log_queue):
+        self.log_queue = log_queue
 
     def write(self, msg):
-        self.textbox.configure(state='normal')
-        self.textbox.insert(tk.END, msg)
-        self.textbox.see(tk.END)
-        self.textbox.configure(state='disabled')
+        if msg:
+            self.log_queue.put(msg)
 
     def flush(self):
         pass
@@ -53,9 +53,10 @@ class IdlixGUI:
         self.root.title("IDLIX Downloader & Player GUI")
         self.root.geometry("1400x650")
 
-        self.idlix = IdlixHelper()
         self.featured_movies = []
         self.poster_images = []
+        self.log_queue = queue.Queue()
+        self.ui_queue = queue.Queue()
         self.ffplay_process = None
 
         # Main container
@@ -84,6 +85,10 @@ class IdlixGUI:
             "<Configure>",
             lambda e: self.poster_canvas.configure(scrollregion=self.poster_canvas.bbox("all"))
         )
+        self.poster_frame.bind(
+            "<Configure>",
+            lambda e: self.poster_canvas.configure(scrollregion=self.poster_canvas.bbox("all"))
+        )
 
         # RIGHT = controls + log
         right_panel = ttk.Frame(main_frame, padding=(10, 0))
@@ -106,43 +111,77 @@ class IdlixGUI:
 
         # Logger injection
         logger.remove()
-        logger.add(GuiLogger(self.log_box), format="{time:HH:mm:ss} | {level} | {message}")
+        logger.add(GuiLogger(self.log_queue), format="{time:HH:mm:ss} | {level} | {message}")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.drain_queues()
 
         # Load posters initially
         self.refresh_featured()
 
+    def call_on_ui(self, callback, *args, **kwargs):
+        self.ui_queue.put((callback, args, kwargs))
+
+    def drain_queues(self):
+        try:
+            while True:
+                msg = self.log_queue.get_nowait()
+                self.log_box.configure(state='normal')
+                self.log_box.insert(tk.END, msg)
+                self.log_box.see(tk.END)
+                self.log_box.configure(state='disabled')
+        except queue.Empty:
+            pass
+
+        try:
+            while True:
+                callback, args, kwargs = self.ui_queue.get_nowait()
+                callback(*args, **kwargs)
+        except queue.Empty:
+            pass
+
+        try:
+            self.root.after(100, self.drain_queues)
+        except tk.TclError:
+            pass
+
     # ============================================================
     # POSTER GRID
     # ============================================================
-    def show_poster_grid(self):
+    def show_poster_grid(self, poster_items):
         for w in self.poster_frame.winfo_children():
             w.destroy()
 
         self.poster_images.clear()
+        self.featured_movies = [item["movie"] for item in poster_items]
 
         posters_per_row = 4
-        size = (150, 210)
         row = col = 0
 
-        for movie in self.featured_movies:
-            try:
-                img_raw = requests.get(movie["poster"], timeout=8).content
-                img = Image.open(BytesIO(img_raw)).resize(size)
-                tk_img = ImageTk.PhotoImage(img)
-            except:
-                continue
-
-            self.poster_images.append(tk_img)
+        for item in poster_items:
+            movie = item["movie"]
+            img = item["image"]
 
             frame = ttk.Frame(self.poster_frame)
             frame.grid(row=row, column=col, padx=10, pady=10)
 
-            tk.Button(
-                frame,
-                image=tk_img,
-                relief="flat",
-                command=lambda m=movie: self.on_poster_click(m)
-            ).pack()
+            if img:
+                tk_img = ImageTk.PhotoImage(img)
+                self.poster_images.append(tk_img)
+
+                tk.Button(
+                    frame,
+                    image=tk_img,
+                    relief="flat",
+                    command=lambda m=movie: self.on_poster_click(m)
+                ).pack()
+            else:
+                tk.Button(
+                    frame,
+                    text="No Poster",
+                    width=18,
+                    height=12,
+                    command=lambda m=movie: self.on_poster_click(m)
+                ).pack()
 
             ttk.Label(
                 frame,
@@ -155,6 +194,30 @@ class IdlixGUI:
             if col >= posters_per_row:
                 col = 0
                 row += 1
+
+        self.poster_canvas.configure(scrollregion=self.poster_canvas.bbox("all"))
+
+    def load_poster_items(self, featured_movies):
+        poster_items = []
+        size = (150, 210)
+
+        for movie in featured_movies:
+            image = None
+            poster_url = movie.get("poster")
+            if poster_url:
+                try:
+                    response = requests.get(poster_url, timeout=8)
+                    response.raise_for_status()
+                    image = Image.open(BytesIO(response.content)).convert("RGB").resize(size)
+                except Exception as exc:
+                    logger.warning(f"Poster unavailable for {movie['title']}: {exc}")
+
+            poster_items.append({
+                "movie": movie,
+                "image": image,
+            })
+
+        return poster_items
 
     # ============================================================
     # POSTER POPUP MENU
@@ -204,6 +267,7 @@ class IdlixGUI:
             popup.destroy()
 
         ttk.Button(popup, text="OK", command=choose).pack(pady=10)
+        popup.protocol("WM_DELETE_WINDOW", popup.destroy)
 
         popup.grab_set()
         self.root.wait_window(popup)
@@ -216,14 +280,15 @@ class IdlixGUI:
     def refresh_featured(self):
         def task():
             logger.info("Loading featured movies...")
-            home = retry(self.idlix.get_home)
+            idlix = IdlixHelper()
+            home = retry(idlix.get_home)
 
             if not home.get("status"):
                 logger.error(f"Failed: {home.get('message')}")
                 return
 
-            self.featured_movies = home["featured_movie"]
-            self.root.after(0, self.show_poster_grid)
+            poster_items = self.load_poster_items(home["featured_movie"])
+            self.call_on_ui(self.show_poster_grid, poster_items)
 
             logger.success("Featured loaded.")
 
@@ -248,12 +313,12 @@ class IdlixGUI:
     def process_movie(self, url: str, mode: str):
 
         def task():
-            idlix = self.idlix
+            idlix = IdlixHelper()
 
             # 1. get video data
             video_data = retry(idlix.get_video_data, url)
             if not video_data.get("status"):
-                logger.error("Error getting video data")
+                logger.error(f"Error getting video data: {video_data.get('message')}")
                 return
 
             logger.info(
@@ -263,7 +328,7 @@ class IdlixGUI:
             # 2. embed URL
             embed = retry(idlix.get_embed_url)
             if not embed.get("status"):
-                logger.error("Error getting embed URL")
+                logger.error(f"Error getting embed URL: {embed.get('message')}")
                 return
 
             logger.success(f"Embed: {embed['embed_url']}")
@@ -271,7 +336,7 @@ class IdlixGUI:
             # 3. m3u8
             m3u8 = retry(idlix.get_m3u8_url)
             if not m3u8.get("status"):
-                logger.error("Error getting M3U8 URL")
+                logger.error(f"Error getting M3U8 URL: {m3u8.get('message')}")
                 return
 
             logger.success(f"M3U8: {m3u8['m3u8_url']}")
@@ -283,14 +348,19 @@ class IdlixGUI:
                 ]
 
                 selected = None
+                selected_event = threading.Event()
 
                 def ask():
                     nonlocal selected
                     selected = self.ask_variant(choices)
+                    selected_event.set()
 
-                self.root.after(0, ask)
-                while selected is None:
-                    self.root.update()
+                self.call_on_ui(ask)
+                selected_event.wait()
+
+                if not selected:
+                    logger.warning("Variant selection cancelled.")
+                    return
 
                 selected_id = selected.split(" - ")[0]
 
@@ -308,7 +378,7 @@ class IdlixGUI:
 
                 subtitle_file = subtitle["subtitle"] if subtitle.get("status") else None
 
-                self.start_ffplay(idlix.m3u8_url, subtitle_file)
+                self.call_on_ui(self.start_ffplay, idlix.m3u8_url, subtitle_file, idlix.video_name)
 
             # DOWNLOAD
             else:
@@ -316,18 +386,23 @@ class IdlixGUI:
                 if result.get("status"):
                     logger.success(f"Downloaded: {result['path']}")
                 else:
-                    logger.error("Download failed.")
+                    logger.error(f"Download failed: {result.get('message')}")
 
         threading.Thread(target=task, daemon=True).start()
 
     # ============================================================
     # ffplay controls
     # ============================================================
-    def start_ffplay(self, m3u8_url, subtitle=None):
+    def start_ffplay(self, m3u8_url, subtitle=None, title="IDLIX Player"):
 
         self.stop_player()
 
-        args = ["ffplay", "-i", m3u8_url, "-window_title", "IDLIX Player", "-loglevel", "panic"]
+        ffplay_path = shutil.which("ffplay")
+        if not ffplay_path:
+            logger.error("ffplay not found. Please install ffmpeg first.")
+            return
+
+        args = [ffplay_path, "-i", m3u8_url, "-window_title", title, "-loglevel", "panic"]
 
         if subtitle:
             args += ["-vf", f"subtitles={subtitle}"]
@@ -350,6 +425,10 @@ class IdlixGUI:
         self.log_box.configure(state="normal")
         self.log_box.delete(1.0, tk.END)
         self.log_box.configure(state="disabled")
+
+    def on_close(self):
+        self.stop_player()
+        self.root.destroy()
 
 
 # ============================================================

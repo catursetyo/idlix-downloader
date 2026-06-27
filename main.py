@@ -114,9 +114,9 @@ def process_movie(idlix_helper, url: str, mode: str):
     else:
         result = idlix_helper.download_m3u8()
         if result.get("status"):
-            logger.success(f"Downloading {video_data['video_name']} success")
+            logger.success(f"Downloaded: {result.get('path')}")
         else:
-            logger.error("Error downloading m3u8")
+            logger.error(f"Error downloading m3u8: {result.get('message')}")
 
 
 def show_featured_table(featured):
