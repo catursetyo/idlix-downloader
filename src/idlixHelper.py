@@ -24,6 +24,11 @@ from curl_cffi import requests as cffi_requests
 class IdlixHelper:
     BASE_WEB_URL = "https://z2.idlixku.com/"
     TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
+    GATE_MAX_ATTEMPTS = 18
+    GATE_MAX_TOTAL_SECONDS = 120
+    GATE_CLAIM_TIMEOUT = 10
+    PLAYLIST_LOAD_TIMEOUT = 15
+    PLAYLIST_LOAD_RETRIES = 3
     BASE_STATIC_HEADERS = {
         "Connection": "keep-alive",
         "sec-ch-ua": "Not)A;Brand;v=99, Google Chrome;v=127, Chromium;v=127",
@@ -275,22 +280,22 @@ class IdlixHelper:
             return path
         return urljoin(self.api_base_url.rstrip("/") + "/", path.lstrip("/"))
 
-    def _api_get(self, path, referer=None):
+    def _api_get(self, path, referer=None, timeout=30):
         request = self.request.get(
             url=self._api_url(path),
             headers=self._json_headers(referer=referer),
-            timeout=30,
+            timeout=timeout,
         )
         if request.status_code < 200 or request.status_code >= 300:
             raise RuntimeError(f"API GET {path} failed: HTTP {request.status_code} - {request.text[:200]}")
         return request.json()
 
-    def _api_post(self, path, payload, referer=None, content_type="application/json"):
+    def _api_post(self, path, payload, referer=None, content_type="application/json", timeout=30):
         request = self.request.post(
             url=self._api_url(path),
             headers=self._json_headers(referer=referer, content_type=content_type),
             data=json.dumps(payload),
-            timeout=30,
+            timeout=timeout,
         )
         if request.status_code < 200 or request.status_code >= 300:
             raise RuntimeError(f"API POST {path} failed: HTTP {request.status_code} - {request.text[:200]}")
@@ -324,6 +329,39 @@ class IdlixHelper:
                 "id": str(index),
             })
         return variants
+
+    def _load_m3u8_playlist(self, url):
+        last_error = None
+        for attempt in range(1, self.PLAYLIST_LOAD_RETRIES + 1):
+            logger.info(
+                "Loading m3u8 playlist "
+                f"(attempt {attempt}/{self.PLAYLIST_LOAD_RETRIES})"
+            )
+            try:
+                request = self.request.get(
+                    url=url,
+                    headers=self._headers(
+                        referer=self.embed_url or self.base_web_url,
+                        accept="*/*",
+                    ),
+                    timeout=self.PLAYLIST_LOAD_TIMEOUT,
+                )
+                if request.status_code < 200 or request.status_code >= 300:
+                    raise RuntimeError(
+                        f"Playlist request failed: HTTP {request.status_code} - "
+                        f"{request.text[:200]}"
+                    )
+                playlist = m3u8.loads(request.text, uri=url)
+                if not playlist.playlists and not playlist.segments:
+                    raise RuntimeError("Playlist response did not contain HLS streams")
+                return playlist
+            except Exception as error_load_playlist:
+                last_error = error_load_playlist
+                logger.warning(f"Playlist load failed: {error_load_playlist}")
+                if attempt < self.PLAYLIST_LOAD_RETRIES:
+                    time.sleep(attempt)
+
+        raise RuntimeError(f"Unable to load m3u8 playlist: {last_error}")
 
     def _log_download_progress(self, progress):
         out_time_ms = progress.get("out_time_ms")
@@ -532,20 +570,61 @@ class IdlixHelper:
 
     def _claim_next_gate(self, play_info):
         gate = play_info
-        for _ in range(12):
+        started_at = time.monotonic()
+
+        for attempt in range(1, self.GATE_MAX_ATTEMPTS + 1):
+            elapsed = time.monotonic() - started_at
+            if elapsed > self.GATE_MAX_TOTAL_SECONDS:
+                raise RuntimeError(
+                    "Playback session gate timed out after "
+                    f"{self.GATE_MAX_TOTAL_SECONDS}s"
+                )
+
             server_now = gate.get("serverNow") or int(time.time() * 1000)
             unlock_at = gate.get("unlockAt") or server_now
             wait_seconds = max(0, (unlock_at - server_now) / 1000)
             if wait_seconds:
-                logger.info(f"Waiting gate countdown: {round(wait_seconds, 1)}s")
-                time.sleep(wait_seconds + 0.5)
+                wait_until = time.monotonic() + wait_seconds + 0.5
+                logger.info(
+                    f"Waiting gate countdown: {round(wait_seconds, 1)}s "
+                    f"(attempt {attempt}/{self.GATE_MAX_ATTEMPTS})"
+                )
+                while True:
+                    remaining = wait_until - time.monotonic()
+                    if remaining <= 0:
+                        break
 
-            claimed = self._api_post(
-                "/watch/session/claim",
-                {"gateToken": gate.get("gateToken")},
-                referer=self.embed_url or self.base_web_url,
+                    sleep_for = min(remaining, 5)
+                    time.sleep(sleep_for)
+                    remaining_after_sleep = max(0, wait_until - time.monotonic())
+                    if remaining_after_sleep:
+                        logger.info(
+                            "Gate countdown remaining: "
+                            f"{round(remaining_after_sleep, 1)}s"
+                        )
+
+            gate_token = gate.get("gateToken")
+            if not gate_token:
+                raise RuntimeError("Gate token missing in play-info response")
+
+            logger.info(
+                "Claiming playback session "
+                f"(attempt {attempt}/{self.GATE_MAX_ATTEMPTS})"
             )
+            try:
+                claimed = self._api_post(
+                    "/watch/session/claim",
+                    {"gateToken": gate_token},
+                    referer=self.embed_url or self.base_web_url,
+                    timeout=self.GATE_CLAIM_TIMEOUT,
+                )
+            except Exception as error_claim_gate:
+                logger.warning(f"Gate claim failed: {error_claim_gate}")
+                time.sleep(min(attempt, 5))
+                continue
+
             if claimed.get("kind") == "pentos":
+                logger.success("Playback session claimed")
                 return claimed
             if claimed.get("kind") == "gate":
                 gate = claimed
@@ -553,7 +632,9 @@ class IdlixHelper:
 
             remaining_ms = claimed.get("remainingMs")
             if remaining_ms:
-                time.sleep(min(max(remaining_ms / 1000, 0.25), 5))
+                wait_seconds = min(max(remaining_ms / 1000, 0.25), 5)
+                logger.info(f"Playback session not ready, retrying in {round(wait_seconds, 1)}s")
+                time.sleep(wait_seconds)
                 continue
 
             raise RuntimeError(f"Unexpected gate response: {claimed}")
@@ -589,6 +670,7 @@ class IdlixHelper:
             play_info = self._api_get(
                 f"/watch/play-info/{self.content_type}/{self.video_id}",
                 referer=self.embed_url or self.base_web_url,
+                timeout=15,
             )
             if play_info.get("kind") == "gate":
                 play_info = self._claim_next_gate(play_info)
@@ -602,7 +684,7 @@ class IdlixHelper:
             redeemed = self._redeem_pentos(play_info)
             self.m3u8_url = redeemed["url"]
             self.next_subtitles = redeemed.get("subtitles") or []
-            self.variant_playlist = m3u8.load(self.m3u8_url)
+            self.variant_playlist = self._load_m3u8_playlist(self.m3u8_url)
             tmp_variant_playlist = self._playlist_variants(self.variant_playlist)
 
             return {
